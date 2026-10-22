@@ -1,0 +1,26 @@
+[Unit]
+Description=Jenkins Automation Server
+After=network.target
+
+[Service]
+Type=simple
+User=jenkins
+Group=jenkins
+WorkingDirectory=/var/lib/jenkins
+
+Environment="JENKINS_HOME=/var/lib/jenkins"
+Environment="CASC_JENKINS_CONFIG=/var/lib/jenkins/jenkins.yaml"
+Environment="JENKINS_ADMIN_PASSWORD={{ jenkins_admin_password }}"
+Environment="CLOUDRU_REGISTRY_URL={{ cloudru_registry_url }}"
+Environment="CLOUDRU_REGISTRY_USER={{ cloudru_registry_user }}"
+Environment="CLOUDRU_REGISTRY_PASSWORD={{ cloudru_registry_password }}"
+Environment="VK_TOKEN={{ vk_token }}"
+Environment="VK_USER_ID={{ vk_user_id }}"
+Environment="APP_DOMAIN={{ app_domain }}"
+
+ExecStart=/usr/bin/java -Djenkins.install.runSetupWizard=false -Djenkins.websocket.WebSocketTransport.skipHostCheck=true -Dcasc.jenkins.config=/var/lib/jenkins/jenkins.yaml -jar /opt/jenkins/jenkins.war --httpPort=8080
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

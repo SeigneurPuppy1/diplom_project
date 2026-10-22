@@ -1,0 +1,96 @@
+---
+# ==============================================================================
+# 1. Базовая проверка доступности и готовности ОС
+# ==============================================================================
+- name: Проверка доступности SSH и готовности ОС на всех серверах
+  hosts: all
+  gather_facts: false
+  any_errors_fatal: false  # Не останавливать весь плейбук из-за одного хоста
+  tasks:
+    - name: Ожидание подключения по SSH (до 5 минут)
+      ansible.builtin.wait_for_connection:
+        delay: 10
+        timeout: 300
+        connect_timeout: 10
+
+    - name: Ожидание завершения cloud-init (надежный способ)
+      ansible.builtin.command: cloud-init status
+      register: ci_status
+      until: "'done' in ci_status.stdout"
+      retries: 20
+      delay: 10
+      changed_when: false
+      failed_when: "'error' in ci_status.stdout or 'degraded' in ci_status.stdout"
+
+    - name: Остановка фоновых служб обновлений Ubuntu (чтобы не блокировали APT)
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - unattended-upgrades
+        - apt-daily
+        - apt-daily-upgrade
+      ignore_errors: true
+
+    - name: Ожидание освобождения lock-файлов APT (с принудительной очисткой при зависании)
+      ansible.builtin.shell: |
+        # Ожидание до 60 секунд (12 попыток по 5 секунд)
+        for i in {1..12}; do
+          if ! fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1; then
+            exit 0
+          fi
+          sleep 5
+        done
+        
+        # Если блокировка всё еще держится, принудительно убиваем процессы и удаляем локи
+        echo "APT lock is still held. Forcefully clearing..."
+        sudo killall -9 apt apt-get dpkg 2>/dev/null || true
+        sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock
+        sudo dpkg --configure -a
+        exit 0
+      changed_when: false
+      timeout: 180
+
+# ==============================================================================
+# 2. Базовая подготовка ОС
+# ==============================================================================
+- name: Подготовка операционных систем на всех ВМ
+  hosts: all
+  become: true
+  roles:
+    - common
+
+# ==============================================================================
+# 3. Развертывание Kubernetes (Строгая последовательность!)
+# ==============================================================================
+- name: Развертывание Kubernetes Master
+  hosts: master
+  become: true
+  roles:
+    - k8s_master
+
+- name: Подключение Worker к Kubernetes
+  hosts: worker
+  become: true
+  roles:
+    - k8s_worker
+
+# ==============================================================================
+# 4. Настройка CI/CD
+# ==============================================================================
+- name: Настройка сервера Jenkins и утилит сборки
+  hosts: jenkins
+  become: true
+  roles:
+    - jenkins
+
+# ==============================================================================
+# 5. Установка Helm-чартов в кластер
+# ==============================================================================
+- name: Развертывание базовых чартов Helm (Ingress, TLS, Monitoring, Logging)
+  hosts: master
+  become: true
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  roles:
+    - k8s_addons

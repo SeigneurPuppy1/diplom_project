@@ -1,0 +1,180 @@
+------------------------------------------------------------
+[ВРЕМЯ]: 2026-10-22 09:42:31
+[ХОСТ]: master-node-v2 (82.202.137.167)
+[ШАГ]: k8s_master -> Инициализация кластера Kubernetes через kubeadm
+[СООБЩЕНИЕ]: Task failed: Timed out after 600 second(s).
+[STDERR]: Пусто
+[КОМАНДА]: Н/Д
+------------------------------------------------------------
+
+------------------------------------------------------------
+[ВРЕМЯ]: 2026-10-22 12:23:16
+[ХОСТ]: worker-node-v2 (85.208.85.181)
+[ШАГ]: k8s_worker -> Скачивание .deb пакетов Kubernetes локально (на ваш ПК)
+[СООБЩЕНИЕ]: Task failed: Premature end of stream waiting for become success.
+>>> Standard Error
+sudo: a password is required
+[STDERR]: Пусто
+[КОМАНДА]: Н/Д
+------------------------------------------------------------
+
+------------------------------------------------------------
+[ВРЕМЯ]: 2026-10-22 12:29:58
+[ХОСТ]: worker-node-v2 (85.208.85.181)
+[ШАГ]: k8s_worker -> Установка пакетов Kubernetes из локальных .deb файлов
+[СООБЩЕНИЕ]: One or more items failed
+[STDERR]: Пусто
+[КОМАНДА]: Н/Д
+------------------------------------------------------------
+
+------------------------------------------------------------
+[ВРЕМЯ]: 2026-10-22 12:36:44
+[ХОСТ]: worker-node-v2 (85.208.85.181)
+[ШАГ]: k8s_worker -> Скачивание GPG-ключа Kubernetes (с таймаутом и повторами)
+[СООБЩЕНИЕ]: Request failed: <urlopen error _ssl.c:983: The handshake operation timed out>
+[STDERR]: Пусто
+[КОМАНДА]: Н/Д
+------------------------------------------------------------
+
+------------------------------------------------------------
+[ВРЕМЯ]: 2026-10-22 14:32:05
+[ХОСТ]: master-node-v2 (88.218.67.228)
+[ШАГ]: k8s_master -> Скачивание .deb пакетов Kubernetes на локальную машину
+[СООБЩЕНИЕ]: The command exited with a non-zero return code.
+[STDERR]: 
+[КОМАНДА]: mkdir -p /tmp/k8s-offline-master
+cd /tmp/k8s-offline-master
+
+# Скачиваем пакеты версии 1.30.0
+curl -sLO https://pkgs.k8s.io/core:/stable:/v1.30/deb/./kubelet_1.30.0-1.1_amd64.deb
+curl -sLO https://pkgs.k8s.io/core:/stable:/v1.30/deb/./kubeadm_1.30.0-1.1_amd64.deb
+curl -sLO https://pkgs.k8s.io/core:/stable:/v1.30/deb/./kubectl_1.30.0-1.1_amd64.deb
+
+# Проверяем, что файлы скачались (размер > 1KB, не HTML-страница ошибки)
+for f in *.deb; do
+  size=$(stat -c%s "$f" 2>/dev/null || echo 0)
+  if [ "$size" -lt 1000 ]; then
+    echo "ERROR: $f is too small ($size bytes), likely an error page"
+    exit 1
+  fi
+done
+
+ls -lh *.deb
+
+------------------------------------------------------------
+
+------------------------------------------------------------
+[ВРЕМЯ]: 2026-10-22 14:38:26
+[ХОСТ]: master-node-v2 (88.218.67.228)
+[ШАГ]: k8s_master -> Установка пакетов Kubernetes из локальных .deb файлов
+[СООБЩЕНИЕ]: One or more items failed
+[STDERR]: Пусто
+[КОМАНДА]: Н/Д
+------------------------------------------------------------
+
+------------------------------------------------------------
+[ВРЕМЯ]: 2026-10-22 14:45:06
+[ХОСТ]: master-node-v2 (88.218.67.228)
+[ШАГ]: k8s_master -> Скачивание .deb пакетов Kubernetes и зависимостей на локальную машину
+[СООБЩЕНИЕ]: The command exited with a non-zero return code.
+[STDERR]: 
+[КОМАНДА]: mkdir -p /tmp/k8s-offline-master
+cd /tmp/k8s-offline-master
+
+# 1. Сначала скачиваем зависимости
+curl -sLO https://pkgs.k8s.io/core:/stable:/v1.30/deb/amd64/cri-tools_1.30.0-1.1_amd64.deb
+curl -sLO https://pkgs.k8s.io/core:/stable:/v1.30/deb/amd64/kubernetes-cni_1.3.0-00_amd64.deb
+
+# 2. Затем основные пакеты
+curl -sLO https://pkgs.k8s.io/core:/stable:/v1.30/deb/amd64/kubelet_1.30.0-1.1_amd64.deb
+curl -sLO https://pkgs.k8s.io/core:/stable:/v1.30/deb/amd64/kubeadm_1.30.0-1.1_amd64.deb
+curl -sLO https://pkgs.k8s.io/core:/stable:/v1.30/deb/amd64/kubectl_1.30.0-1.1_amd64.deb
+
+# 3. Проверка: файлы должны весить больше 1 МБ (защита от HTML-страниц ошибок)
+for f in *.deb; do
+  size=$(stat -c%s "$f" 2>/dev/null || echo 0)
+  if [ "$size" -lt 1000000 ]; then
+    echo "ERROR: $f is too small ($size bytes), likely an error page"
+    cat "$f"
+    exit 1
+  fi
+done
+
+ls -lh *.deb
+
+------------------------------------------------------------
+
+------------------------------------------------------------
+[ВРЕМЯ]: 2026-10-22 14:49:12
+[ХОСТ]: master-node-v2 (88.218.67.228)
+[ШАГ]: k8s_master -> Скачивание пакетов Kubernetes и зависимостей через apt-get download (локально)
+[СООБЩЕНИЕ]: Task failed: Premature end of stream waiting for become success.
+>>> Standard Error
+sudo: a password is required
+[STDERR]: Пусто
+[КОМАНДА]: Н/Д
+------------------------------------------------------------
+
+------------------------------------------------------------
+[ВРЕМЯ]: 2026-10-22 14:57:47
+[ХОСТ]: worker-node-v2 (176.108.255.102)
+[ШАГ]: k8s_worker -> Скачивание .deb пакетов Kubernetes и зависимостей на локальную машину
+[СООБЩЕНИЕ]: The command exited with a non-zero return code.
+[STDERR]: 
+[КОМАНДА]: mkdir -p /tmp/k8s-offline-worker
+cd /tmp/k8s-offline-worker
+
+curl -sLO https://pkgs.k8s.io/core:/stable:/v1.30/deb/amd64/cri-tools_1.30.0-1.1_amd64.deb
+curl -sLO https://pkgs.k8s.io/core:/stable:/v1.30/deb/amd64/kubernetes-cni_1.3.0-00_amd64.deb
+curl -sLO https://pkgs.k8s.io/core:/stable:/v1.30/deb/amd64/kubelet_1.30.0-1.1_amd64.deb
+curl -sLO https://pkgs.k8s.io/core:/stable:/v1.30/deb/amd64/kubeadm_1.30.0-1.1_amd64.deb
+curl -sLO https://pkgs.k8s.io/core:/stable:/v1.30/deb/amd64/kubectl_1.30.0-1.1_amd64.deb
+
+for f in *.deb; do
+  size=$(stat -c%s "$f" 2>/dev/null || echo 0)
+  if [ "$size" -lt 1000000 ]; then
+    echo "ERROR: $f is too small ($size bytes)"
+    cat "$f"
+    exit 1
+  fi
+done
+ls -lh *.deb
+
+------------------------------------------------------------
+
+------------------------------------------------------------
+[ВРЕМЯ]: 2026-10-22 17:20:18
+[ХОСТ]: master-node-v2 (88.218.67.228)
+[ШАГ]: k8s_master -> Инициализация кластера Kubernetes через kubeadm
+[СООБЩЕНИЕ]: Task failed: Timed out after 600 second(s).
+[STDERR]: Пусто
+[КОМАНДА]: Н/Д
+------------------------------------------------------------
+
+------------------------------------------------------------
+[ВРЕМЯ]: 2026-10-22 17:39:35
+[ХОСТ]: worker-node-v2 (82.202.156.78)
+[ШАГ]: k8s_worker -> Подключение Worker к кластеру через join-команду
+[СООБЩЕНИЕ]: Task failed: Timed out after 300 second(s).
+[STDERR]: Пусто
+[КОМАНДА]: Н/Д
+------------------------------------------------------------
+
+------------------------------------------------------------
+[ВРЕМЯ]: 2026-10-22 17:46:15
+[ХОСТ]: worker-node-v2 (82.202.156.78)
+[ШАГ]: k8s_worker -> Подключение Worker к кластеру через join-команду
+[СООБЩЕНИЕ]: Task failed: Timed out after 300 second(s).
+[STDERR]: Пусто
+[КОМАНДА]: Н/Д
+------------------------------------------------------------
+
+------------------------------------------------------------
+[ВРЕМЯ]: 2026-10-22 18:23:22
+[ХОСТ]: master-node-v2 (88.218.67.228)
+[ШАГ]: k8s_master -> Ожидание готовности kube-apiserver к приёму запросов
+[СООБЩЕНИЕ]: The command exited with a non-zero return code.
+[STDERR]: Error from server (Forbidden): nodes is forbidden: User "kubernetes-admin" cannot list resource "nodes" in API group "" at the cluster scope
+[КОМАНДА]: ['kubectl', 'get', 'nodes']
+------------------------------------------------------------
+

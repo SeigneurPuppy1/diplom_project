@@ -1,0 +1,154 @@
+<?xml version='1.1' encoding='UTF-8'?>
+<flow-definition plugin="workflow-job">
+  <description>CI/CD pipeline для Golang приложения</description>
+  <keepDependencies>false</keepDependencies>
+  <properties/>
+  <definition class="org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition" plugin="workflow-cps">
+    <script><![CDATA[
+pipeline {
+    agent any
+    environment {
+        REGISTRY_URL = 'golang.cr.cloud.ru'
+        REPOSITORY_NAME = 'golang-helloworld'
+        REPO_URL = 'https://github.com/SeigneurPuppy1/diplom_project'
+        APP_DOMAIN = 'golang.azeti.online'
+        REGISTRY_CREDS_ID = 'cloudru-registry-creds'
+    }
+    stages {
+        stage('Clone') {
+            steps {
+                sh 'rm -rf app && mkdir -p app'
+                dir('app') {
+                    sh 'git clone -b go ${REPO_URL} .'
+                }
+            }
+        }
+        stage('Test') {
+            steps { 
+                dir('app') { sh 'go test -v -cover ./...' } 
+            }
+        }
+        stage('Build') {
+            steps {
+                dir('app') {
+                    script {
+                        sh '''
+                            cat << 'EOF' > Dockerfile
+FROM golang:1.22-alpine AS builder
+WORKDIR /app
+COPY . .
+RUN go mod download
+RUN CGO_ENABLED=0 GOOS=linux go build -o /main .
+
+FROM alpine:latest
+WORKDIR /root/
+COPY --from=builder /main .
+EXPOSE 8080
+CMD ["./main"]
+EOF
+                        '''
+                        def currentTag = "build-${env.BUILD_NUMBER}"
+                        env.IMAGE_TAG = currentTag
+                        sh "docker build -t ${REGISTRY_URL}/${REPOSITORY_NAME}:${currentTag} ."
+                        sh "docker tag ${REGISTRY_URL}/${REPOSITORY_NAME}:${currentTag} ${REGISTRY_URL}/${REPOSITORY_NAME}:latest"
+                    }
+                }
+            }
+        }
+        stage('Push') {
+            steps {
+                script {
+                    withCredentials([usernamePassword(credentialsId: REGISTRY_CREDS_ID, usernameVariable: 'REG_USER', passwordVariable: 'REG_PASS')]) {
+                        sh "echo \"\${REG_PASS}\" | docker login ${REGISTRY_URL} -u \"\${REG_USER}\" --password-stdin"
+                        sh "docker push ${REGISTRY_URL}/${REPOSITORY_NAME}:${env.IMAGE_TAG}"
+                        sh "docker push ${REGISTRY_URL}/${REPOSITORY_NAME}:latest"
+                    }
+                }
+            }
+        }
+        stage('Deploy') {
+            steps {
+                script {
+                    sh 'kubectl create namespace production --dry-run=client -o yaml | kubectl apply -f -'
+                    withCredentials([usernamePassword(credentialsId: REGISTRY_CREDS_ID, usernameVariable: 'REG_USER', passwordVariable: 'REG_PASS')]) {
+                        sh 'kubectl get secret cloudru-registry-secret -n production >/dev/null 2>&1 || kubectl create secret docker-registry cloudru-registry-secret --docker-server=${REGISTRY_URL} --docker-username="${REG_USER}" --docker-password="${REG_PASS}" --namespace=production'
+                    }
+                    sh "helm upgrade --install golang-app /var/lib/jenkins/helm-chart --set image.repository=${REGISTRY_URL}/${REPOSITORY_NAME} --set image.tag=${env.IMAGE_TAG} --set imagePullSecrets[0].name=cloudru-registry-secret --namespace production --create-namespace --wait --timeout 300s"
+                    
+                    sh 'kubectl rollout restart deployment/golang-app -n production'
+                    sh 'echo "Ожидание перезапуска подов и применения нового образа..."'
+                    sh 'sleep 15'
+                }
+            }
+        }
+        stage('Health Check') {
+            steps {
+                script {
+                    sh '''
+                        for i in {1..15}; do
+                            HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" https://${APP_DOMAIN}/)
+                            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "301" ] || [ "$HTTP_CODE" = "302" ]; then
+                                echo "OK (HTTP $HTTP_CODE)"
+                                exit 0
+                            fi
+                            echo "Ожидание... (текущий HTTP-код: $HTTP_CODE)"
+                            sleep 10
+                        done
+                        echo "Failed: Приложение не отвечает ожидаемым кодом."
+                        echo "Последний ответ сервера:"
+                        curl -sk https://${APP_DOMAIN}/ || true
+                        exit 1
+                    '''
+                }
+            }
+        }
+    }
+    post {
+        always {
+            echo "Пайплайн завершен. Статус: ${currentBuild.result ?: 'UNKNOWN'}"
+        }
+        success {
+            script {
+                echo "Все этапы выполнены успешно! Отправляю уведомление..."
+                withCredentials([string(credentialsId: 'vk-token', variable: 'VK_TOKEN'), string(credentialsId: 'vk-user-id', variable: 'VK_USER_ID')]) {
+                    sh '''
+                        J_BASE="https://jenkins.azeti.online"
+                        BUILD_LINK="${J_BASE}/job/${JOB_NAME}/${BUILD_NUMBER}/console"
+                        
+                        curl -s -X POST "https://api.vk.com/method/messages.send" \\
+                           -d "peer_id=${VK_USER_ID}" \\
+                           -d "message= *Успех!* Сборка ${JOB_NAME} #${BUILD_NUMBER} завершена успешно.\\n🔗 Консоль: ${BUILD_LINK}\\n🌐 Сайт: https://${APP_DOMAIN}" \\
+                           -d "random_id=$(date +%s)" \\
+                           -d "access_token=${VK_TOKEN}" \\
+                           -d "v=5.199" > /dev/null
+                        echo "Уведомление об успехе отправлено в ВК."
+                    '''
+                }
+            }
+        }
+        failure {
+            script {
+                echo "Пайплайн завершился с ошибками! Отправляю уведомление..."
+                withCredentials([string(credentialsId: 'vk-token', variable: 'VK_TOKEN'), string(credentialsId: 'vk-user-id', variable: 'VK_USER_ID')]) {
+                    sh '''
+                        J_BASE="http://jenkins.azeti.online:8080"
+                        BUILD_LINK="${J_BASE}/job/${JOB_NAME}/${BUILD_NUMBER}/console"
+
+                        curl -s -X POST "https://api.vk.com/method/messages.send" \\
+                           -d "peer_id=${VK_USER_ID}" \\
+                           -d "message=❌ *Ошибка!* Сборка ${JOB_NAME} #${BUILD_NUMBER} завершилась с ошибкой.\\n🔗 Консоль: ${BUILD_LINK}" \\
+                           -d "random_id=$(date +%s)" \\
+                           -d "access_token=${VK_TOKEN}" \\
+                           -d "v=5.199" > /dev/null
+                        echo "Уведомление об ошибке отправлено в ВК."
+                    '''
+                }
+            }
+        }
+    }
+}
+]]></script>
+  </definition>
+  <triggers/>
+  <disabled>false</disabled>
+</flow-definition>

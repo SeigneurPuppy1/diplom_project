@@ -1,0 +1,629 @@
+---
+- name: Установка и настройка Jenkins и DevOps-инструментов
+  block:
+    # ==============================================================================
+    # УМНОЕ УПРАВЛЕНИЕ ПАРОЛЕМ JENKINS (Генерация и сохранение локально)
+    # ==============================================================================
+    - name: Управление паролем администратора Jenkins
+      block:
+        - name: Проверка наличия файла с паролем на управляющей машине
+          ansible.builtin.stat:
+            path: "{{ playbook_dir }}/jenkins_admin_password.txt"
+          delegate_to: localhost
+          become: false
+          run_once: true
+          register: pwd_file
+
+        - name: Генерация надежного пароля (ТОЛЬКО буквы и цифры, без спецсимволов!)
+          ansible.builtin.shell: "tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 12"
+          delegate_to: localhost
+          become: false
+          run_once: true
+          register: new_pwd
+          when: not pwd_file.stat.exists
+
+        - name: Сохранение пароля в локальный файл (только при первом запуске)
+          ansible.builtin.copy:
+            content: "{{ new_pwd.stdout }}"
+            dest: "{{ playbook_dir }}/jenkins_admin_password.txt"
+            mode: '0600'
+          delegate_to: localhost
+          become: false
+          run_once: true
+          when: not pwd_file.stat.exists
+
+        - name: Чтение пароля из локального файла
+          ansible.builtin.slurp:
+            src: "{{ playbook_dir }}/jenkins_admin_password.txt"
+          delegate_to: localhost
+          become: false
+          run_once: true
+          register: pwd_content
+
+        - name: Установка переменной jenkins_admin_password для пайплайна
+          ansible.builtin.set_fact:
+            jenkins_admin_password: "{{ pwd_content.content | b64decode | trim }}"
+    # ==============================================================================
+
+    - name: Ожидание завершения cloud-init
+      ansible.builtin.command: cloud-init status
+      register: ci_status
+      until: "'done' in ci_status.stdout"
+      retries: 20
+      delay: 10
+      changed_when: false
+      failed_when: "'error' in ci_status.stdout or 'degraded' in ci_status.stdout"
+
+    - name: Ожидание освобождения lock-файлов APT
+      ansible.builtin.shell: |
+        for i in {1..30}; do
+          if ! fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1; then
+            exit 0
+          fi
+          sleep 5
+        done
+        exit 1
+      changed_when: false
+      timeout: 180
+
+    - name: Установка базовых утилит, Java 21, Docker и Golang
+      ansible.builtin.apt:
+        name:
+          - openjdk-21-jre-headless
+          - git
+          - curl
+          - ca-certificates
+          - docker.io
+          - golang-go
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      register: apt_install_result
+      retries: 5
+      delay: 15
+      until: apt_install_result is succeeded
+      timeout: 600
+
+    - name: Включение и запуск Docker
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Добавление SSH-пользователя в группу docker
+      ansible.builtin.user:
+        name: "{{ ansible_user | default('ubuntu') }}"
+        groups: docker
+        append: true
+
+    - name: Создание системной группы jenkins
+      ansible.builtin.group:
+        name: jenkins
+        state: present
+        system: true
+
+    - name: Создание системного пользователя jenkins
+      ansible.builtin.user:
+        name: jenkins
+        group: jenkins
+        groups: docker
+        append: true
+        home: /var/lib/jenkins
+        shell: /bin/bash
+        system: true
+        create_home: true
+
+    - name: Создание каталогов Jenkins
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: jenkins
+        group: jenkins
+        mode: '0755'
+      loop:
+        - /opt/jenkins
+        - /var/log/jenkins
+        - /var/lib/jenkins/helm-chart
+
+    - name: Скачивание Jenkins WAR
+      ansible.builtin.get_url:
+        url: https://get.jenkins.io/war-stable/latest/jenkins.war
+        dest: /opt/jenkins/jenkins.war
+        owner: jenkins
+        group: jenkins
+        mode: '0644'
+        timeout: 600
+      register: jenkins_war_download
+      retries: 3
+      delay: 15
+      until: jenkins_war_download is not failed
+
+    - name: Создание systemd-сервиса Jenkins (с переменными окружения для Registry и VK)
+      ansible.builtin.template:
+        src: jenkins.service.j2
+        dest: /etc/systemd/system/jenkins.service
+        mode: '0644'
+
+    - name: Настройка Jenkins Configuration as Code (JCasC)
+      ansible.builtin.template:
+        src: jenkins.yaml.j2
+        dest: /var/lib/jenkins/jenkins.yaml
+        owner: jenkins
+        group: jenkins
+        mode: '0644'
+
+    - name: Установка обязательных плагинов Jenkins
+      ansible.builtin.shell: |
+        curl -fsSL https://github.com/jenkinsci/plugin-installation-manager-tool/releases/download/2.12.3/jenkins-plugin-manager-2.12.3.jar \
+          -o /tmp/jenkins-plugin-manager.jar
+
+        java -jar /tmp/jenkins-plugin-manager.jar \
+          --war /opt/jenkins/jenkins.war \
+          --plugin-download-directory /var/lib/jenkins/plugins \
+          --plugins \
+            configuration-as-code:latest \
+            job-dsl:latest \
+            workflow-aggregator:latest \
+            workflow-job:latest \
+            workflow-cps:latest \
+            git:latest \
+            docker-workflow:latest \
+            kubernetes-cli:latest \
+            credentials:latest \
+            credentials-binding:latest
+      register: plugins_install
+      changed_when: plugins_install.rc == 0
+
+    - name: Установка kubectl
+      ansible.builtin.get_url:
+        url: https://dl.k8s.io/release/v1.30.0/bin/linux/amd64/kubectl
+        dest: /usr/local/bin/kubectl
+        mode: '0755'
+        timeout: 60
+      register: kubectl_download
+      retries: 3
+      delay: 10
+      until: kubectl_download is succeeded
+
+    - name: Установка Helm
+      ansible.builtin.shell: |
+        set -o pipefail
+        curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      args:
+        executable: /bin/bash
+        creates: /usr/local/bin/helm
+      timeout: 120
+
+    # ==============================================================================
+
+    - name: Создание структуры директорий для Helm-чарта
+      ansible.builtin.file:
+        path: "/var/lib/jenkins/helm-chart/{{ item }}"
+        state: directory
+        owner: jenkins
+        group: jenkins
+        mode: '0755'
+      loop:
+        - templates
+
+    - name: Создание Chart.yaml
+      ansible.builtin.copy:
+        content: |
+          apiVersion: v2
+          name: golang-app
+          description: A Helm chart for Golang application
+          type: application
+          version: 0.1.0
+          appVersion: "1.0.0"
+        dest: /var/lib/jenkins/helm-chart/Chart.yaml
+        owner: jenkins
+        group: jenkins
+        mode: '0644'
+
+    - name: Создание values.yaml (с настройками TLS для Cert-Manager)
+      ansible.builtin.copy:
+        content: |
+          replicaCount: 1
+          image:
+            repository: golang.cr.cloud.ru/golang-helloworld
+            tag: "latest"
+            pullPolicy: Always
+          imagePullSecrets:
+            - name: cloudru-registry-secret
+          service:
+            name: golang-app
+            type: ClusterIP
+            port: 8080
+            targetPort: 8080
+          ingress:
+            enabled: true
+            className: nginx
+            annotations:
+              cert-manager.io/cluster-issuer: "letsencrypt-prod"
+            hosts:
+              - host: golang.azeti.online
+                paths:
+                  - path: /
+                    pathType: Prefix
+                    backend:
+                      service:
+                        name: golang-app
+                        port:
+                          number: 8080
+            tls:
+              - secretName: golang-app-tls
+                hosts:
+                  - golang.azeti.online
+        dest: /var/lib/jenkins/helm-chart/values.yaml
+        owner: jenkins
+        group: jenkins
+        mode: '0644'
+
+    - name: Создание templates/deployment.yaml
+      ansible.builtin.copy:
+        content: |
+          {% raw %}
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: golang-app
+            labels:
+              app: golang-app
+          spec:
+            replicas: {{ .Values.replicaCount }}
+            selector:
+              matchLabels:
+                app: golang-app
+            template:
+              metadata:
+                labels:
+                  app: golang-app
+              spec:
+                {{- with .Values.imagePullSecrets }}
+                imagePullSecrets:
+                  {{- toYaml . | nindent 6 }}
+                {{- end }}
+                containers:
+                  - name: app
+                    image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+                    imagePullPolicy: {{ .Values.image.pullPolicy }}
+                    ports:
+                      - name: http
+                        containerPort: 8080
+                        protocol: TCP
+          {% endraw %}
+        dest: /var/lib/jenkins/helm-chart/templates/deployment.yaml
+        owner: jenkins
+        group: jenkins
+        mode: '0644'
+
+    - name: Создание templates/service.yaml
+      ansible.builtin.copy:
+        content: |
+          {% raw %}
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: golang-app
+            labels:
+              app: golang-app
+          spec:
+            type: {{ .Values.service.type }}
+            ports:
+              - port: {{ .Values.service.port }}
+                targetPort: {{ .Values.service.targetPort }}
+                protocol: TCP
+                name: http
+            selector:
+              app: golang-app
+          {% endraw %}
+        dest: /var/lib/jenkins/helm-chart/templates/service.yaml
+        owner: jenkins
+        group: jenkins
+        mode: '0644'
+
+    - name: Создание templates/ingress.yaml (с поддержкой TLS)
+      ansible.builtin.copy:
+        content: |
+          {% raw %}
+          {{- if .Values.ingress.enabled }}
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: golang-app
+            labels:
+              app: golang-app
+            annotations:
+              {{- with .Values.ingress.annotations }}
+              {{- toYaml . | nindent 4 }}
+              {{- end }}
+          spec:
+            ingressClassName: {{ .Values.ingress.className }}
+            {{- if .Values.ingress.tls }}
+            tls:
+              {{- range .Values.ingress.tls }}
+              - hosts:
+                  {{- range .hosts }}
+                  - {{ . | quote }}
+                  {{- end }}
+                secretName: {{ .secretName }}
+              {{- end }}
+            {{- end }}
+            rules:
+              {{- range .Values.ingress.hosts }}
+              - host: {{ .host | quote }}
+                http:
+                  paths:
+                    {{- range .paths }}
+                    - path: {{ .path }}
+                      pathType: {{ .pathType }}
+                      backend:
+                        service:
+                          name: {{ .backend.service.name }}
+                          port:
+                            number: {{ .backend.service.port.number }}
+                    {{- end }}
+              {{- end }}
+          {{- end }}
+          {% endraw %}
+        dest: /var/lib/jenkins/helm-chart/templates/ingress.yaml
+        owner: jenkins
+        group: jenkins
+        mode: '0644'
+    # ==============================================================================
+
+    - name: Получение внутреннего IP мастера из инвентаря
+      ansible.builtin.set_fact:
+        k8s_api_private_ip: "{{ hostvars[groups['master'][0]].master_internal_ip }}"
+
+    - name: Проверка адреса Kubernetes API для Jenkins
+      ansible.builtin.assert:
+        that:
+          - k8s_api_private_ip is defined
+          - k8s_api_private_ip | length > 0
+        fail_msg: >-
+          Не удалось получить master_internal_ip из инвентаря.
+          Убедитесь, что в inventory.tftpl для группы [master] прописана переменная master_internal_ip.
+
+    - name: Чтение kubeconfig с мастера
+      ansible.builtin.slurp:
+        src: /etc/kubernetes/admin.conf
+      delegate_to: "{{ groups['master'][0] }}"
+      become: true
+      register: master_kubeconfig
+      no_log: true
+
+    - name: Подготовка kubeconfig для Jenkins (замена IP адреса API сервера на внутренний)
+      ansible.builtin.set_fact:
+        jenkins_kubeconfig: >-
+          {{
+            (master_kubeconfig.content | b64decode)
+            | regex_replace(
+                '(?m)^(\s*server:\s*)https://.*$',
+                '\g<1>https://' ~ k8s_api_private_ip ~ ':6443'
+              )
+          }}
+      no_log: true
+
+    - name: Создание каталога kubeconfig для jenkins
+      ansible.builtin.file:
+        path: /var/lib/jenkins/.kube
+        state: directory
+        owner: jenkins
+        group: jenkins
+        mode: '0700'
+
+    - name: Установка kubeconfig для jenkins
+      ansible.builtin.copy:
+        dest: /var/lib/jenkins/.kube/config
+        content: "{{ jenkins_kubeconfig }}"
+        owner: jenkins
+        group: jenkins
+        mode: '0600'
+      no_log: true
+
+    - name: "Первичный запуск Jenkins"
+      ansible.builtin.systemd:
+        name: jenkins
+        daemon_reload: true
+        state: started
+        enabled: true
+
+    # ==============================================================================
+    # НАСТРОЙКА HTTPS ДЛЯ JENKINS ЧЕРЕЗ NGINX И LET'S ENCRYPT
+    # ==============================================================================
+    - name: Установка Nginx и Certbot
+      ansible.builtin.apt:
+        name:
+          - nginx
+          - certbot
+          - python3-certbot-nginx
+        state: present
+        update_cache: true
+
+    - name: Создание директории для ACME challenge (webroot)
+      ansible.builtin.file:
+        path: /var/www/html/.well-known/acme-challenge
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: '0755'
+
+    - name: Временная HTTP конфигурация Nginx (только для получения сертификата)
+      ansible.builtin.copy:
+        content: |
+          server {
+              listen 80;
+              server_name jenkins.azeti.online;
+              
+              location /.well-known/acme-challenge/ {
+                  root /var/www/html;
+              }
+              
+              location / {
+                  return 301 https://$host$request_uri;
+              }
+          }
+        dest: /etc/nginx/sites-available/jenkins
+        mode: '0644'
+
+    - name: Активация конфигурации Nginx
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/jenkins
+        dest: /etc/nginx/sites-enabled/jenkins
+        state: link
+
+    - name: Удаление дефолтной конфигурации Nginx
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Запуск Nginx для прохождения проверки Let's Encrypt
+      ansible.builtin.systemd:
+        name: nginx
+        state: started
+        enabled: true
+
+    - name: Получение SSL-сертификата через webroot
+      ansible.builtin.shell: |
+        certbot certonly --webroot -w /var/www/html \
+          -d jenkins.azeti.online \
+          --non-interactive \
+          --agree-tos \
+          --email admin@azeti.online
+      args:
+        creates: /etc/letsencrypt/live/jenkins.azeti.online/fullchain.pem
+      register: certbot_result
+
+    - name: Применение ФИНАЛЬНОЙ конфигурации Nginx (с HTTPS)
+      ansible.builtin.template:
+        src: jenkins-nginx.conf.j2
+        dest: /etc/nginx/sites-available/jenkins
+        mode: '0644'
+      when: certbot_result.changed or certbot_result.failed == false
+
+    - name: Перезапуск Nginx для применения HTTPS конфигурации
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+      when: certbot_result.changed or certbot_result.failed == false
+    # ==============================================================================
+
+    - name: "Перезапуск Jenkins для применения новых переменных окружения"
+      ansible.builtin.systemd:
+        name: jenkins
+        state: restarted
+        daemon_reload: true
+
+    - name: "Ожидание открытия порта 8080 после перезапуска"
+      ansible.builtin.wait_for:
+        port: 8080
+        delay: 15
+        timeout: 120
+        state: started
+
+    - name: "Пауза для гарантированного применения JCasC (создание credentials)"
+      ansible.builtin.pause:
+        seconds: 45
+
+    # ==============================================================================
+    # СОЗДАНИЕ ДЖОБЫ ЧЕРЕЗ JENKINS CLI (с флагом -http для обхода 403)
+    # ==============================================================================
+
+    - name: "Ожидание полной готовности Jenkins (HTTP 200/302 OK)"
+      ansible.builtin.uri:
+        url: "http://localhost:8080/login"
+        status_code: 200, 302
+      register: jenkins_ready
+      retries: 15
+      delay: 10
+      until: jenkins_ready.status in [200, 302]
+
+    - name: "Скачивание Jenkins CLI jar"
+      ansible.builtin.get_url:
+        url: "http://localhost:8080/jnlpJars/jenkins-cli.jar"
+        dest: /tmp/jenkins-cli.jar
+        mode: '0644'
+      register: cli_download
+      retries: 5
+      delay: 5
+      until: cli_download is succeeded
+
+    - name: "Копирование job-config.xml на сервер"
+      ansible.builtin.copy:
+        src: job-config.xml
+        dest: /tmp/job-config.xml
+        mode: '0644'
+
+    - name: "Удаление старой джобы (если существует)"
+      ansible.builtin.shell: |
+        java -jar /tmp/jenkins-cli.jar -s http://localhost:8080/ -http -auth 'admin:{{ jenkins_admin_password }}' delete-job golang-app-cicd || true
+      changed_when: false
+
+    - name: "Создание джобы через Jenkins CLI (ВАЖНО: добавлены кавычки для защиты пароля)"
+      ansible.builtin.shell: |
+        java -jar /tmp/jenkins-cli.jar -s http://localhost:8080/ -http -auth 'admin:{{ jenkins_admin_password }}' create-job golang-app-cicd < /tmp/job-config.xml
+      register: cli_create
+      changed_when: cli_create.rc == 0
+      failed_when: cli_create.rc != 0
+
+    # ==============================================================================
+    # Одобрение скрипта через передачу файла в stdin
+    # ==============================================================================
+    - name: "Создание Groovy-скрипта для одобрения"
+      ansible.builtin.copy:
+        content: |
+          import jenkins.model.Jenkins
+          import org.jenkinsci.plugins.scriptsecurity.scripts.ScriptApproval
+          def approval = ScriptApproval.get()
+          approval.pendingScripts.each { script ->
+              approval.approveScript(script.hash)
+          }
+          println "Approved pending scripts"
+        dest: /tmp/approve-scripts.groovy
+        mode: '0644'
+
+    - name: "Автоматическое одобрение скриптов безопасности (Script Approval)"
+      ansible.builtin.shell: |
+        cat /tmp/approve-scripts.groovy | java -jar /tmp/jenkins-cli.jar -s http://localhost:8080/ -http -auth 'admin:{{ jenkins_admin_password }}' groovy =
+      register: approve_scripts
+      changed_when: approve_scripts.rc == 0
+      failed_when: false
+
+    - name: "Проверка создания джобы через CLI"
+      ansible.builtin.shell: |
+        java -jar /tmp/jenkins-cli.jar -s http://localhost:8080/ -http -auth 'admin:{{ jenkins_admin_password }}' list-jobs
+      register: jobs_check
+      changed_when: false
+      failed_when: false
+
+    - name: "Вывод списка джоб для отладки"
+      ansible.builtin.debug:
+        msg: "Список джоб в Jenkins: {{ jobs_check.stdout_lines }}"
+
+    - name: "Запуск первого билда через CLI (теперь скрипт одобрен)"
+      ansible.builtin.shell: |
+        java -jar /tmp/jenkins-cli.jar -s http://localhost:8080/ -http -auth 'admin:{{ jenkins_admin_password }}' build golang-app-cicd || true
+      changed_when: false
+      ignore_errors: true
+
+  rescue:
+    - name: "Запись отчёта об ошибке на ВМ Jenkins"
+      ansible.builtin.copy:
+        dest: /var/log/ansible_install_error.log
+        mode: '0600'
+        content: |
+          ==============================
+          Ansible Task Failed!
+          Host: {{ inventory_hostname }}
+          Failed Task: {{ ansible_failed_task.name | default('Неизвестно') }}
+          Message: {{ ansible_failed_result.msg | default('Нет сообщения') }}
+          Stderr: {{ ansible_failed_result.stderr | default(ansible_failed_result.module_stderr | default('Нет') ) }}
+          Command: {{ ansible_failed_result.cmd | default('Нет') }}
+          ==============================
+
+    - name: "Прерывание роли с явным сообщением"
+      ansible.builtin.fail:
+        msg: >-
+          Ошибка на шаге '{{ ansible_failed_task.name | default("Неизвестно") }}'.
+          Лог на ВМ: /var/log/ansible_install_error.log

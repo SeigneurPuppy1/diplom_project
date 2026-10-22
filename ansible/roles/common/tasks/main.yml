@@ -1,0 +1,65 @@
+---
+- name: Отключение SWAP
+  ansible.builtin.command: swapoff -a
+  changed_when: false
+
+- name: Отключение SWAP в /etc/fstab
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^(\s*)([^#\n]+\s+swap\s+.*)$'
+    replace: '# \1\2'
+
+- name: Сохранение списка модулей ядра для загрузки при старте
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/k8s.conf
+    mode: '0644'
+    content: |
+      overlay
+      br_netfilter
+
+- name: Активация модулей ядра в текущей сессии
+  community.general.modprobe:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - overlay
+    - br_netfilter
+
+- name: Настройка sysctl параметров для Kubernetes и сети
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    sysctl_file: /etc/sysctl.d/k8s.conf
+    state: present
+    reload: true
+  loop:
+    - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+    - { key: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+    - { key: 'net.ipv4.ip_forward', value: '1' }
+
+- name: Установка пакета containerd
+  ansible.builtin.apt:
+    name: containerd
+    state: present
+    update_cache: true
+
+- name: Создание каталога конфигурации containerd
+  ansible.builtin.file:
+    path: /etc/containerd
+    state: directory
+    mode: '0755'
+
+- name: Генерация полной конфигурации containerd по умолчанию
+  ansible.builtin.shell: containerd config default > /etc/containerd/config.toml
+
+- name: Включение SystemdCgroup в containerd
+  ansible.builtin.replace:
+    path: /etc/containerd/config.toml
+    regexp: '(\s*)SystemdCgroup = false'
+    replace: '\1SystemdCgroup = true'
+
+- name: Запуск и включение службы containerd
+  ansible.builtin.systemd:
+    name: containerd
+    state: restarted
+    enabled: true

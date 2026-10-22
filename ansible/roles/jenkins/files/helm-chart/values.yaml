@@ -1,0 +1,38 @@
+replicaCount: 2
+image:
+  repository: golang.cr.cloud.ru/golang-helloworld
+  tag: latest
+  pullPolicy: Always
+
+# указываю Kubernetes использовать секрет для скачивания из приватного Registry
+imagePullSecrets:
+  - name: cloudru-registry-secret
+
+service:
+  type: ClusterIP
+  port: 8080
+  targetPort: 8080
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+  hosts:
+    - host: golang.azeti.online
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: golang-tls
+      hosts:
+        - golang.azeti.online
+
+resources:
+  limits:
+    cpu: 200m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi

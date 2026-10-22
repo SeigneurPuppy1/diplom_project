@@ -1,0 +1,41 @@
+jenkins:
+  systemMessage: "DevOps CI/CD - Automated via Ansible + JCasC"
+  mode: NORMAL
+  numExecutors: 2
+  labelString: "master"
+  
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: "admin"
+          password: "${JENKINS_ADMIN_PASSWORD}"
+
+  authorizationStrategy:
+    loggedInUsersCanDoAnything:
+      allowAnonymousRead: false
+
+unclassified:
+  location:
+    url: "https://jenkins.azeti.online/"
+
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - string:
+              scope: GLOBAL
+              id: "vk-token"
+              secret: "${VK_TOKEN}"
+              description: "VK API Access Token"
+          - string:
+              scope: GLOBAL
+              id: "vk-user-id"
+              secret: "${VK_USER_ID}"
+              description: "VK User ID for Notifications"
+          - usernamePassword:
+              scope: GLOBAL
+              id: "cloudru-registry-creds"
+              username: "${CLOUDRU_REGISTRY_USER}"
+              password: "${CLOUDRU_REGISTRY_PASSWORD}"
+              description: "Cloud.ru Evolution Artifact Registry"

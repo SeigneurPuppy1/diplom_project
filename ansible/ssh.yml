@@ -1,0 +1,19 @@
+---
+- name: Ожидание готовности SSH и окружения на хостах
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Ожидание сквозного SSH-подключения с авторизацией
+      ansible.builtin.wait_for_connection:
+        delay: 5
+        timeout: 300
+        connect_timeout: 10
+
+    - name: Ожидание завершения cloud-init (снятие блокировок apt/dpkg)
+      ansible.builtin.raw: >
+        which cloud-init >/dev/null 2>&1 && cloud-init status --wait || exit 0
+      changed_when: false
+
+    - name: Первичный сбор фактов системы
+      ansible.builtin.setup:
+

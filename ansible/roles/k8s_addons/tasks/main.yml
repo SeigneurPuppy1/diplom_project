@@ -1,0 +1,297 @@
+---
+# 1. Тюнинг ядра ОС для Elasticsearch
+- name: Установка параметра vm.max_map_count для Elasticsearch
+  become: true
+  ansible.posix.sysctl:
+    name: vm.max_map_count
+    value: '262144'
+    state: present
+    reload: true
+
+- name: Проверка наличия Helm
+  ansible.builtin.stat:
+    path: /usr/local/bin/helm
+  register: helm_bin
+
+- name: Установка Helm на master-node
+  become: true
+  ansible.builtin.shell: |
+    curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+  when: not helm_bin.stat.exists
+
+# 2. Добавление официальных Helm-репозиториев
+- name: Добавление Helm-репозиториев
+  kubernetes.core.helm_repository:
+    name: "{{ item.name }}"
+    repo_url: "{{ item.url }}"
+    kubeconfig: /home/ubuntu/.kube/config
+  loop:
+    - { name: 'ingress-nginx', url: 'https://kubernetes.github.io/ingress-nginx' }
+    - { name: 'prometheus-community', url: 'https://prometheus-community.github.io/helm-charts' }
+
+# ==============================================================================
+# 3. Развёртывание Ingress NGINX
+# ==============================================================================
+
+- name: Добавление метки worker-узлам для привязки Ingress Controller
+  ansible.builtin.shell: |
+    kubectl label nodes --selector='!node-role.kubernetes.io/control-plane' node-role.kubernetes.io/worker=worker --overwrite
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  changed_when: false
+  ignore_errors: true
+
+- name: Установка Ingress NGINX Controller (NodePort режим для NLB)
+  kubernetes.core.helm:
+    name: ingress-nginx
+    chart_ref: ingress-nginx/ingress-nginx
+    release_namespace: ingress-nginx
+    create_namespace: true
+    kubeconfig: /home/ubuntu/.kube/config
+    wait: true
+    wait_timeout: "3m0s"
+    values:
+      controller:
+        nodeSelector:
+          node-role.kubernetes.io/worker: "worker"
+        service:
+          enabled: true
+          type: NodePort
+          nodePorts:
+            http: 30080
+            https: 30443
+      admissionWebhooks:
+        enabled: false
+
+# 4. Развёртывание cert-manager
+- name: Установка cert-manager через официальный манифест GitHub
+  ansible.builtin.shell: kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.17.1/cert-manager.yaml
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+
+- name: Ожидание готовности cert-manager-webhook
+  ansible.builtin.shell: kubectl rollout status deployment/cert-manager-webhook -n cert-manager --timeout=120s
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  register: cert_manager_rollout
+  failed_when: cert_manager_rollout.rc != 0
+
+- name: Копирование шаблона ClusterIssuer
+  ansible.builtin.template:
+    src: cluster-issuer.yml.j2
+    dest: /tmp/cluster-issuer.yml
+    mode: '0644'
+
+- name: Применение ClusterIssuer Let's Encrypt
+  ansible.builtin.shell: kubectl apply -f /tmp/cluster-issuer.yml
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+
+# 5. Развёртывание Prometheus и Grafana
+- name: Установка kube-prometheus-stack
+  kubernetes.core.helm:
+    name: kube-prometheus-stack
+    chart_ref: prometheus-community/kube-prometheus-stack
+    release_namespace: monitoring
+    create_namespace: true
+    kubeconfig: /home/ubuntu/.kube/config
+    wait: false
+    values:
+      grafana:
+        adminPassword: "admin"
+        service:
+          type: ClusterIP
+
+# 6. Развёртывание стека логирования (EFK: Elasticsearch, Kibana, Filebeat)
+- name: Создание пространства имён logging
+  ansible.builtin.shell: kubectl create namespace logging --dry-run=client -o yaml | kubectl apply -f -
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+
+- name: Копирование манифеста EFK-стека
+  ansible.builtin.copy:
+    dest: /tmp/efk-stack.yml
+    mode: '0644'
+    content: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: elasticsearch
+        namespace: logging
+        labels:
+          app: elasticsearch
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: elasticsearch
+        template:
+          metadata:
+            labels:
+              app: elasticsearch
+          spec:
+            containers:
+            - name: elasticsearch
+              image: mirror.gcr.io/library/elasticsearch:7.17.18
+              env:
+              - name: discovery.type
+                value: "single-node"
+              - name: ES_JAVA_OPTS
+                value: "-Xms512m -Xmx512m"
+              ports:
+              - containerPort: 9200
+                name: http
+              volumeMounts:
+              - name: es-data
+                mountPath: /usr/share/elasticsearch/data
+              resources:
+                limits:
+                  memory: "1Gi"
+                requests:
+                  memory: "512Mi"
+            volumes:
+            - name: es-data
+              emptyDir: {}
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: elasticsearch
+        namespace: logging
+      spec:
+        selector:
+          app: elasticsearch
+        ports:
+        - port: 9200
+          targetPort: 9200
+      ---
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: kibana
+        namespace: logging
+        labels:
+          app: kibana
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: kibana
+        template:
+          metadata:
+            labels:
+              app: kibana
+          spec:
+            containers:
+            - name: kibana
+              image: mirror.gcr.io/library/kibana:7.17.18
+              env:
+              - name: ELASTICSEARCH_HOSTS
+                value: "http://elasticsearch:9200"
+              ports:
+              - containerPort: 5601
+                name: http
+              resources:
+                limits:
+                  memory: "1Gi"
+                requests:
+                  memory: "512Mi"
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: kibana
+        namespace: logging
+      spec:
+        selector:
+          app: kibana
+        ports:
+        - port: 5601
+          targetPort: 5601
+      ---
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: filebeat-config
+        namespace: logging
+      data:
+        filebeat.yml: |
+          filebeat.inputs:
+          - type: container
+            paths:
+              - /var/log/pods/*/*/*.log
+          output.elasticsearch:
+            hosts: ["http://elasticsearch:9200"]
+      ---
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: filebeat
+        namespace: logging
+        labels:
+          app: filebeat
+      spec:
+        selector:
+          matchLabels:
+            app: filebeat
+        template:
+          metadata:
+            labels:
+              app: filebeat
+          spec:
+            containers:
+            - name: filebeat
+              image: mirror.gcr.io/elastic/filebeat:7.17.18
+              volumeMounts:
+              - name: config
+                mountPath: /usr/share/filebeat/filebeat.yml
+                subPath: filebeat.yml
+                readOnly: true
+              - name: varlogpods
+                mountPath: /var/log/pods
+                readOnly: true
+              - name: varlogcontainers
+                mountPath: /var/log/containers
+                readOnly: true
+              resources:
+                limits:
+                  memory: "256Mi"
+                requests:
+                  memory: "100Mi"
+            volumes:
+            - name: config
+              configMap:
+                name: filebeat-config
+            - name: varlogpods
+              hostPath:
+                path: /var/log/pods
+            - name: varlogcontainers
+              hostPath:
+                path: /var/log/containers
+
+- name: Применение манифеста EFK-стека
+  ansible.builtin.shell: kubectl apply -f /tmp/efk-stack.yml
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+
+- name: Ожидание готовности пода Elasticsearch
+  ansible.builtin.shell: kubectl rollout status deployment/elasticsearch -n logging --timeout=300s
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+
+- name: Ожидание готовности пода Kibana
+  ansible.builtin.shell: kubectl rollout status deployment/kibana -n logging --timeout=180s
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+
+# 7. Ingress для Grafana и Kibana из отдельного шаблона
+- name: Рендеринг манифеста Ingress для Grafana и Kibana
+  ansible.builtin.template:
+    src: system-ingress.yaml.j2
+    dest: /tmp/system-ingress.yaml
+    mode: '0644'
+
+- name: Применение Ingress для Grafana и Kibana
+  ansible.builtin.command: kubectl apply -f /tmp/system-ingress.yaml
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
